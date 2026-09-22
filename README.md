@@ -237,3 +237,63 @@ Only the resulting GIF is kept; temporary rendering frames are removed automatic
 
 This repository is MIT-licensed. Laya, `laya-mlx`, their model weights and their dependencies retain
 their respective licenses and notices.
+
+## PPO training (Stable-Baselines3)
+
+The optional Gymnasium adapter uses the same five keyboard actions and gravity as Laya/human
+play, without a planner or safety shield. Install and train with:
+
+```bash
+uv sync --extra dev --extra rl
+uv run --extra rl python scripts/train_ppo.py --timesteps 100000
+```
+
+This means **100,000 engine inputs**, not 100,000 complete games or gradient updates. Four
+vector environments collect 1,000 steps per rollout; other requested budgets round up to a full
+rollout. The CPU MLP observes the locked board, active cells, current/next piece types,
+rotation, position and gravity phase. Unseen seven-bag contents remain hidden.
+
+Reward on each piece lock is `10 * cleared_lines**2 + 1 - 0.5 * delta_holes
+- 0.05 * delta_aggregate_height - 0.02 * delta_bumpiness`; topping out costs another 5.
+Other ticks have zero reward. Episodes end on top-out or truncate at 10,000 inputs.
+This shaping reward is distinct from the game's score.
+
+Outputs go to `artifacts/ppo-100k/`: `model.zip`, per-environment Monitor CSVs, and
+`evaluation.json` containing deterministic PPO and random-policy results on the same 20
+held-out seeds (10,000–10,019). The script reloads the saved model before evaluation.
+Use `--output artifacts/another-run` for a new run; existing output folders are protected.
+A 100k run is an initial baseline, not a guarantee of strong Tetris play.
+
+```python
+from stable_baselines3 import PPO
+from tetris_for_laya.rl_env import TetrisEnv
+
+model = PPO.load("artifacts/ppo-100k/model.zip")
+env = TetrisEnv()
+obs, info = env.reset(seed=42)
+action, _ = model.predict(obs, deterministic=True)
+obs, reward, terminated, truncated, info = env.step(int(action))
+```
+
+Watch the saved PPO model in the terminal (deterministic actions, Q or Ctrl-C to quit):
+
+```bash
+uv run --extra rl python scripts/play_ppo.py --fps 30
+```
+
+Use `--model PATH` to select a checkpoint, `--seed 42` for another game, or
+`--no-alt-screen` to keep the final board visible. The terminal should be at least
+78 columns × 22 rows. `--headless` runs a quick non-rendered playback check.
+
+Continue a checkpoint for 100,000 **complete games** (no per-game step cutoff):
+
+```bash
+uv run --extra rl python scripts/train_ppo.py --episodes 100000 \
+  --resume artifacts/ppo-100k/model.zip --output artifacts/ppo-100k-games
+```
+
+Episode mode counts actual top-outs and finishes training the final rollout, so it can
+slightly exceed the requested game count. `status.json` tracks completed games;
+`latest.zip` is refreshed approximately every 1,000 games. `model.zip` and
+`evaluation.json` are written on completion. Evaluation still has a 10,000-step
+safety cutoff, reported separately as truncation in each episode result.

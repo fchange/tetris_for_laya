@@ -57,6 +57,7 @@ class DecisionView:
     inference_ms: float | None = None
     step: int = 0
     policy_name: str = "LAYA"
+    shield_enabled: bool = True
 
 
 def _solid_cell(kind: str) -> Text:
@@ -216,7 +217,13 @@ def _decision_panel(decision: DecisionView | None) -> Panel:
     details.append(decision.executed or "—", style="bold bright_green")
     details.append("\nSHIELD    ", style="dim white")
     details.append(
-        "APPLIED" if decision.shield_applied else "CLEAR",
+        (
+            "OFF"
+            if not decision.shield_enabled
+            else "APPLIED"
+            if decision.shield_applied
+            else "CLEAR"
+        ),
         style="bold bright_yellow" if decision.shield_applied else "bright_green",
     )
     details.append("\nINFERENCE ", style="dim white")
