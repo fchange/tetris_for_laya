@@ -1,0 +1,35 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "tetris-for-laya"
+version = "0.1.0"
+description = "A Rich terminal Tetris environment designed for local Laya MLX play"
+readme = "README.md"
+requires-python = ">=3.11"
+license = "MIT"
+authors = [{ name = "tetris_for_laya contributors" }]
+dependencies = [
+  "rich>=15,<16",
+  "laya-mlx>=0.1,<0.2; sys_platform == 'darwin' and platform_machine == 'arm64'",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8", "ruff>=0.12"]
+
+[project.scripts]
+tetris-for-laya = "tetris_for_laya.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/tetris_for_laya"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = ["integration: requires a downloaded Laya MLX checkpoint"]
+
+[tool.ruff]
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F", "I"]
