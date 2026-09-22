@@ -1,9 +1,10 @@
-"""Command-line entry point for human and local Laya play."""
+"""Command-line entry point for human, local Laya and online Jev play."""
 
 from __future__ import annotations
 
 import argparse
 import json
+import math
 import select
 import sys
 import termios
@@ -16,6 +17,7 @@ from rich.console import Console
 from rich.live import Live
 
 from .game import TetrisGame
+from .jev import DEFAULT_JEV_MODEL, JevAgent
 from .policy import DEFAULT_MODEL, DecisionError, LayaPolicy, PolicyDecision
 from .ui import CandidateView, DecisionView, render_game
 
@@ -46,7 +48,9 @@ class Keyboard:
             termios.tcsetattr(self.fd, termios.TCSADRAIN, self.saved)
 
 
-def _decision_view(decision: PolicyDecision, step: int = 0) -> DecisionView:
+def _decision_view(
+    decision: PolicyDecision, step: int = 0, policy_name: str = "LAYA"
+) -> DecisionView:
     return DecisionView(
         candidates=tuple(
             CandidateView(candidate.label, decision.probabilities[candidate.label])
@@ -57,6 +61,7 @@ def _decision_view(decision: PolicyDecision, step: int = 0) -> DecisionView:
         shield_applied=decision.intervened,
         inference_ms=decision.inference_ms if decision.model_called else None,
         step=step,
+        policy_name=policy_name,
     )
 
 
@@ -84,9 +89,15 @@ def _summary(
 
 
 def _run_laya(args: argparse.Namespace, console: Console) -> int:
-    print("Loading local Laya MLX FP16 weights; gameplay stays offline...", file=sys.stderr)
+    provider = args.player.upper()
     try:
-        policy = LayaPolicy(args.model, optimize=args.optimize)
+        if args.player == "jev":
+            agent = JevAgent(args.jev_model, timeout=args.jev_timeout)
+            policy = LayaPolicy(agent=agent)
+            print(f"Online Jev ({args.jev_model}); one API request per input...", file=sys.stderr)
+        else:
+            print("Loading local Laya MLX FP16 weights; gameplay stays offline...", file=sys.stderr)
+            policy = LayaPolicy(args.model, optimize=args.optimize)
     except (FileNotFoundError, ValueError) as error:
         print(error, file=sys.stderr)
         return 2
@@ -95,9 +106,10 @@ def _run_laya(args: argparse.Namespace, console: Console) -> int:
     started = time.perf_counter()
     inference: list[float] = []
     interventions = 0
+    input_tokens = 0
     live = (
         Live(
-            render_game(game.snapshot(), DecisionView()),
+            render_game(game.snapshot(), DecisionView(policy_name=provider)),
             console=console,
             screen=not args.no_alt_screen,
             auto_refresh=False,
@@ -110,6 +122,8 @@ def _run_laya(args: argparse.Namespace, console: Console) -> int:
         with Keyboard() if live else nullcontext() as keys, live if live else nullcontext():
             while not game.game_over:
                 if args.pieces is not None and game.pieces >= args.pieces:
+                    break
+                if args.steps is not None and game.steps >= args.steps:
                     break
                 if live:
                     pressed = keys.read().lower()
@@ -127,20 +141,26 @@ def _run_laya(args: argparse.Namespace, console: Console) -> int:
                 try:
                     decision = policy.decide(game)
                 except DecisionError as error:
-                    print(f"Laya decision rejected: {error}", file=sys.stderr)
+                    print(f"{provider} decision rejected: {error}", file=sys.stderr)
                     return 3
                 if decision.model_called:
                     inference.append(decision.inference_ms)
+                input_tokens += decision.input_tokens
                 interventions += decision.intervened
                 game.step(decision.executed)
                 if live:
-                    view = _decision_view(decision, game.steps)
+                    view = _decision_view(decision, game.steps, provider)
                     live.update(render_game(game.snapshot(), view), refresh=True)
                 if args.fps is not None:
                     time.sleep(max(0, 1 / args.fps - (time.perf_counter() - step_started)))
     except KeyboardInterrupt:
         pass
-    print(json.dumps(_summary(game, started, inference, interventions), indent=2))
+    summary = _summary(game, started, inference, interventions)
+    summary.update(player=args.player, seed=args.seed, input_tokens=input_tokens)
+    summary["model"] = (
+        agent.resolved_model or args.jev_model if args.player == "jev" else str(args.model)
+    )
+    print(json.dumps(summary, indent=2))
     return 0
 
 
@@ -197,18 +217,21 @@ def _run_human(args: argparse.Namespace, console: Console) -> int:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--player", choices=("laya", "human"), default="laya")
+    parser.add_argument("--player", choices=("laya", "jev", "human"), default="laya")
     parser.add_argument("--model", type=Path, default=DEFAULT_MODEL)
+    parser.add_argument("--jev-model", default=DEFAULT_JEV_MODEL)
+    parser.add_argument("--jev-timeout", type=float, default=30, help="API timeout in seconds")
+    parser.add_argument("--steps", type=int, help="Stop after this many inputs/model calls")
     parser.add_argument("--seed", type=int, default=7)
     parser.add_argument("--level", type=int, choices=range(10), default=0)
     parser.add_argument("--pieces", type=int, help="Stop after this many locked pieces")
     parser.add_argument(
-        "--fps", type=float, help="Optional Laya action rate cap; default runs at model speed"
+        "--fps", type=float, help="Optional AI action rate cap; default runs at model speed"
     )
     parser.add_argument(
         "--optimize", action="store_true", help="Enable MLX compile and prompt cache"
     )
-    parser.add_argument("--headless", action="store_true", help="Run Laya without terminal drawing")
+    parser.add_argument("--headless", action="store_true", help="Run AI without terminal drawing")
     parser.add_argument("--no-alt-screen", action="store_true", help="Keep the final frame visible")
     return parser
 
@@ -218,11 +241,17 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     if args.pieces is not None and args.pieces < 1:
         parser.error("--pieces must be positive")
+    if args.steps is not None and args.steps < 1:
+        parser.error("--steps must be positive")
+    if not math.isfinite(args.jev_timeout) or args.jev_timeout <= 0:
+        parser.error("--jev-timeout must be a positive finite number")
+    if args.player == "jev" and args.optimize:
+        parser.error("--optimize applies only to local Laya")
     if args.fps is not None and not 1 <= args.fps <= 240:
         parser.error("--fps must be between 1 and 240")
     console = Console(highlight=False)
     if args.player == "human":
         return _run_human(args, console)
     if not args.headless and not console.is_terminal:
-        parser.error("Interactive Laya display needs a TTY; use --headless otherwise")
+        parser.error("Interactive AI display needs a TTY; use --headless otherwise")
     return _run_laya(args, console)

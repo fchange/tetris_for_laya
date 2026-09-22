@@ -56,6 +56,7 @@ class DecisionView:
     shield_applied: bool = False
     inference_ms: float | None = None
     step: int = 0
+    policy_name: str = "LAYA"
 
 
 def _solid_cell(kind: str) -> Text:
@@ -226,7 +227,7 @@ def _decision_panel(decision: DecisionView | None) -> Panel:
 
     return Panel(
         details,
-        title="[bold bright_magenta] LAYA [/bold bright_magenta]",
+        title=f"[bold bright_magenta] {decision.policy_name} [/bold bright_magenta]",
         box=box.HEAVY,
         border_style="grey50",
         padding=(0, 1),

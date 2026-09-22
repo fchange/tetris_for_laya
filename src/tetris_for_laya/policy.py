@@ -190,16 +190,16 @@ class LayaPolicy:
             raw_probabilities = answer["probabilities"]
             probabilities = {action: float(raw_probabilities[action]) for action in ACTIONS}
         except (KeyError, TypeError, ValueError) as error:
-            raise DecisionError("Laya returned an incomplete action distribution") from error
+            raise DecisionError("Model returned an incomplete action distribution") from error
         if any(not math.isfinite(value) or not 0 <= value <= 1 for value in probabilities.values()):
-            raise DecisionError("Laya returned a non-finite or out-of-range probability")
+            raise DecisionError("Model returned a non-finite or out-of-range probability")
         if not math.isclose(sum(probabilities.values()), 1.0, abs_tol=0.005):
-            raise DecisionError("Laya action probabilities do not sum to one")
+            raise DecisionError("Model action probabilities do not sum to one")
 
         proposed = str(answer.get("choice", ""))
         by_label = {c.label: c for c in candidates}
         if proposed not in by_label and not self.guarded:
-            raise DecisionError(f"Laya proposed an unknown action: {proposed!r}")
+            raise DecisionError(f"Model proposed an unknown action: {proposed!r}")
         executed = proposed
         if self.guarded:
             chosen = by_label.get(proposed)

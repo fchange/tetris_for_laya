@@ -96,6 +96,44 @@ Other useful flags:
 `--optimize` has a noticeable first-use compilation cost and is intended for longer runs; eager
 mode is the better default for a quick game.
 
+## Compare with online Jev
+
+Online Jev uses the **same state, instruction, action descriptions, eight-step history and legality
+guard** as local Laya. Only the inference backend changes. Gravity still advances by input count,
+so network latency changes wall-clock speed, not the number of moves available before a piece falls.
+The API receives the complete shared prompt; Laya additionally encodes it with its local tokenizer.
+
+Set the token locally and start a bounded run:
+
+```bash
+export TYPESAFE_API_KEY="your-token"
+uv run tetris-for-laya --player jev --seed 7 --pieces 20 --steps 2000
+```
+
+Jev needs no local checkpoint and no additional Python dependencies. `--steps` caps engine inputs
+and API calls; each step makes one paid API request. Press Q to quit between requests, or Ctrl-C
+to interrupt a pending request. The UI labels the backend JEV. The summary includes the actual
+model version returned by the API, seed, input tokens, decisions and legality-guard interventions.
+There are no automatic retries or fallback to local inference on errors.
+
+For a headless comparison with identical limits:
+
+```bash
+uv run tetris-for-laya --player jev --headless --seed 7 --pieces 20 --steps 2000
+uv run tetris-for-laya --player laya --headless --seed 7 --pieces 20 --steps 2000
+```
+
+`--jev-model` defaults to `jev-latest`; pin a supported model ID for repeatable comparisons.
+`--jev-timeout` defaults to 30 seconds. Use `--fps 1` if you need a lower request rate.
+HTTP(S) proxy environment variables are supported by the standard-library HTTP client.
+For an HTTP or mixed proxy listener (replace the port with your proxy's actual port):
+
+```bash
+export HTTPS_PROXY="http://127.0.0.1:7897"
+```
+
+The endpoint and payload follow the [TypeSafe quick start](https://docs.typesafe.ai/introduction/quickstart).
+
 ## What Laya actually does
 
 This is a feature-assisted typed-decision environment, not an end-to-end vision agent.
