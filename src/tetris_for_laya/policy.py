@@ -1,17 +1,29 @@
-"""Laya placement policy with an explicit deterministic candidate planner."""
+"""One Laya keyboard decision per step, with explicit lookahead and safety checks."""
 
 from __future__ import annotations
 
+import heapq
 import math
 import os
 import time
+from collections import defaultdict, deque
 from dataclasses import dataclass
+from itertools import count
 from pathlib import Path
 from typing import Any, Protocol
 
-from .game import BOARD_HEIGHT, BOARD_WIDTH, Board, PlacementOption, TetrisGame
+from .game import (
+    ACTIONS,
+    GRAVITY_STEPS,
+    Landing,
+    Piece,
+    PlacementOption,
+    StepTransition,
+    TetrisGame,
+)
 
 DEFAULT_MODEL = Path("models/laya-multilingual-mlx")
+Node = tuple[Piece, int]
 
 
 class DecisionError(RuntimeError):
@@ -25,7 +37,9 @@ class AgentLike(Protocol):
 @dataclass(frozen=True, slots=True)
 class Candidate:
     label: str
-    placement: PlacementOption
+    transition: StepTransition
+    outcome: PlacementOption
+    remaining_steps: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -40,14 +54,8 @@ class PolicyDecision:
     input_tokens: int
     model_called: bool
 
-    @property
-    def placement(self) -> PlacementOption:
-        return next(c.placement for c in self.candidates if c.label == self.executed)
-
 
 def _quality(option: PlacementOption) -> float:
-    """Classic linear board evaluation used only to build Laya's safe frontier."""
-
     return (
         0.760666 * option.lines
         - 0.510066 * option.aggregate_height
@@ -56,50 +64,80 @@ def _quality(option: PlacementOption) -> float:
     )
 
 
-def _rank(option: PlacementOption) -> tuple[int, float, int, int]:
-    """Keep the model's choice set small without secretly choosing its final move."""
-
+def _rank(option: PlacementOption, steps: int) -> tuple:
     return (
         int(option.top_out),
         -_quality(option),
+        steps,
         option.landing.rotation,
         option.landing.x,
+        option.landing.y,
     )
 
 
-def shortlist_options(
-    options: tuple[PlacementOption, ...], limit: int = 8
-) -> tuple[Candidate, ...]:
-    """Return a bounded, stable choice set suitable for Laya's decision head."""
+class _Lookahead:
+    """Evaluate reachable futures with the same single-step physics as play.
 
-    if limit < 2:
-        raise ValueError("candidate limit must be at least 2")
-    if not options:
-        return ()
-    safe = [option for option in options if not option.top_out]
-    pool = safe or list(options)
-    selected = sorted(pool, key=_rank)[:limit]
-    # Do not leak the planner rank through option order or label numbering.
-    selected.sort(key=lambda option: (option.landing.rotation, option.landing.x))
-    return tuple(Candidate(f"P{index + 1}", option) for index, option in enumerate(selected))
+    The board stays fixed while a piece falls. Cache this graph until it locks;
+    each decision queries it from the actual current pose and gravity phase.
+    No path or final placement is sent to the execution loop.
+    """
 
+    def __init__(self, game: TetrisGame) -> None:
+        start = (game.current, game.gravity_phase)
+        self.transitions: dict[Node, dict[str, StepTransition]] = {}
+        self.values: dict[Node, tuple[tuple, PlacementOption]] = {}
+        self.terminals: dict[Landing, PlacementOption] = {}
+        reverse: dict[Node, list[Node]] = defaultdict(list)
+        queue = deque([start])
+        seen = {start}
+        heap = []
+        serial = count()
+        while queue:
+            node = queue.popleft()
+            edges = self.transitions[node] = {}
+            for action in ACTIONS:
+                transition = game.preview_step(action, piece=node[0], gravity_phase=node[1])
+                edges[action] = transition
+                if transition.locked:
+                    piece = transition.piece
+                    landing = Landing(piece.rotation, piece.x, piece.y)
+                    if landing not in self.terminals:
+                        self.terminals[landing] = game.evaluate_landing(landing)
+                    outcome = self.terminals[landing]
+                    heapq.heappush(heap, (_rank(outcome, 1), next(serial), node, outcome))
+                else:
+                    target = (transition.piece, transition.gravity_phase)
+                    reverse[target].append(node)
+                    if target not in seen:
+                        seen.add(target)
+                        queue.append(target)
 
-def board_metrics(board: Board) -> tuple[int, int, int, int]:
-    heights: list[int] = []
-    holes = 0
-    for x in range(BOARD_WIDTH):
-        first = next(
-            (y for y in range(BOARD_HEIGHT) if board[y][x] is not None),
-            BOARD_HEIGHT,
-        )
-        heights.append(BOARD_HEIGHT - first)
-        holes += sum(board[y][x] is None for y in range(first + 1, BOARD_HEIGHT))
-    return (
-        holes,
-        max(heights, default=0),
-        sum(heights),
-        sum(abs(a - b) for a, b in zip(heights, heights[1:])),
-    )
+        # Reverse shortest paths: quality first, then fewer inputs.
+        # Distance breaks reversible LEFT/RIGHT ties without executing a path.
+        while heap:
+            rank, _, node, outcome = heapq.heappop(heap)
+            if node in self.values:
+                continue
+            self.values[node] = (rank, outcome)
+            for parent in reverse[node]:
+                if parent not in self.values:
+                    heapq.heappush(
+                        heap, (_rank(outcome, rank[2] + 1), next(serial), parent, outcome)
+                    )
+
+    def candidates(self, node: Node) -> tuple[Candidate, ...]:
+        candidates = []
+        for action, transition in self.transitions[node].items():
+            if transition.locked:
+                piece = transition.piece
+                outcome = self.terminals[Landing(piece.rotation, piece.x, piece.y)]
+                steps = 1
+            else:
+                rank, outcome = self.values[(transition.piece, transition.gravity_phase)]
+                steps = rank[2] + 1
+            candidates.append(Candidate(action, transition, outcome, steps))
+        return tuple(candidates)
 
 
 def resolve_checkpoint(value: str | Path = DEFAULT_MODEL) -> Path:
@@ -128,19 +166,19 @@ def resolve_checkpoint(value: str | Path = DEFAULT_MODEL) -> Path:
 
 
 class LayaPolicy:
-    """Ask Laya to choose one final landing for each tetromino."""
+    """Observe the current piece and ask Laya for exactly one keyboard action."""
 
     def __init__(
         self,
         model: str | Path = DEFAULT_MODEL,
         *,
-        candidate_limit: int = 2,
         guarded: bool = True,
         optimize: bool = False,
         agent: AgentLike | None = None,
     ) -> None:
-        self.candidate_limit = candidate_limit
         self.guarded = guarded
+        self._board_key: tuple | None = None
+        self._seen: set[Node] = set()
         if agent is not None:
             self.agent = agent
             self.model_path: Path | None = None
@@ -160,55 +198,65 @@ class LayaPolicy:
         )
 
     def decide(self, game: TetrisGame) -> PolicyDecision:
+        if game.game_over:
+            raise DecisionError("The game is over")
         started = time.perf_counter()
-        candidates = shortlist_options(game.placement_options(), self.candidate_limit)
-        if not candidates:
-            raise DecisionError("No legal placement is available")
-        if len(candidates) == 1:
-            only = candidates[0]
-            return PolicyDecision(
-                candidates=candidates,
-                probabilities={only.label: 1.0},
-                proposed="PLANNER ONLY",
-                executed=only.label,
-                intervened=True,
-                inference_ms=0.0,
-                decision_ms=(time.perf_counter() - started) * 1000,
-                input_tokens=0,
-                model_called=False,
-            )
-
         snapshot = game.snapshot()
-        holes, max_height, aggregate_height, bumpiness = board_metrics(snapshot.board)
+        node = (snapshot.current, game.gravity_phase)
+        key = (snapshot.pieces, snapshot.board, snapshot.current.kind, snapshot.next_kind)
+        if key != self._board_key or node not in self._lookahead.transitions:
+            self._lookahead = _Lookahead(game)
+            self._board_key = key
+            self._seen.clear()
+        self._seen.add(node)
+        candidates = self._lookahead.candidates(node)
+        usable = [
+            c for c in candidates if c.label == "WAIT" or c.transition.moved or c.transition.locked
+        ]
+        fresh = [
+            c
+            for c in usable
+            if c.transition.locked
+            or (c.transition.piece, c.transition.gravity_phase) not in self._seen
+        ]
+        best = min(fresh or usable, key=lambda c: _rank(c.outcome, c.remaining_steps))
+        piece = snapshot.current
         state = (
-            f"Tetris. Current piece: {snapshot.current.kind}. Next piece: {snapshot.next_kind}. "
-            f"Board holes: {holes}. Maximum height: {max_height}. "
-            f"Aggregate height: {aggregate_height}. Bumpiness: {bumpiness}."
+            f"Tetris keyboard control. Current piece {piece.kind}: "
+            f"x={piece.x}, y={piece.y}, rotation={piece.rotation}. Next: {snapshot.next_kind}. "
+            f"Gravity in {GRAVITY_STEPS - game.gravity_phase} inputs. "
+            f"Lookahead recommends {best.label}. Execute only ONE action, then observe again. "
+            "Do not move merely to stay active; WAIT is a deliberate action."
         )
-        minimum_height = min(c.placement.max_height for c in candidates)
-        minimum_bumpiness = min(c.placement.bumpiness for c in candidates)
-        maximum_lines = max(c.placement.lines for c in candidates)
-        criteria = {
-            candidate.label: (
-                f"Rotate to state {candidate.placement.landing.rotation}; "
-                f"place at column {candidate.placement.landing.x}. "
-                f"Result: {candidate.placement.holes} holes; "
-                f"clears {candidate.placement.lines} lines"
-                f"{' (best available)' if maximum_lines and candidate.placement.lines == maximum_lines else ''}; "
-                f"maximum height {candidate.placement.max_height}"
-                f"{' (lowest available)' if candidate.placement.max_height == minimum_height else ''}; "
-                f"aggregate height {candidate.placement.aggregate_height}; "
-                f"bumpiness {candidate.placement.bumpiness}"
-                f"{' (smoothest available)' if candidate.placement.bumpiness == minimum_bumpiness else ''}."
-            )
-            for candidate in candidates
+        descriptions = {
+            "LEFT": "Move left ONE column",
+            "RIGHT": "Move right ONE column",
+            "ROTATE": "Rotate clockwise ONCE, using wall kicks if needed",
+            "DOWN": "Move down ONE row; lock only if already resting",
+            "WAIT": "Do not move or rotate; let the gravity clock advance",
         }
+        criteria = {}
+        for candidate in candidates:
+            transition, outcome = candidate.transition, candidate.outcome
+            criteria[candidate.label] = (
+                f"{descriptions[candidate.label]}. "
+                f"{'Input blocked. ' if candidate not in usable else ''}"
+                f"{'Locks now. ' if transition.locked else ''}"
+                f"Best reachable future after this key: {outcome.holes} holes, "
+                f"{outcome.lines} lines cleared, height {outcome.max_height}, "
+                f"{candidate.remaining_steps} inputs to lock. "
+                f"{'TOP OUT. ' if outcome.top_out else ''}"
+                f"{'Recommended next key.' if candidate.label == best.label else ''}"
+            )
         questions = {
-            "placement": {
+            "action": {
                 "type": "choice",
                 "instructions": (
-                    "Choose the legal placement that best avoids holes and top-out, "
-                    "clears lines, and keeps the board low and smooth."
+                    "Choose the next single keyboard action. Avoid blocked keys and top-out, "
+                    "minimize future holes and clear lines. Use LEFT, RIGHT or ROTATE only when "
+                    "it improves the reachable board. Choose WAIT when the current column and "
+                    "rotation are already suitable and natural gravity can safely continue. "
+                    "Use the lookahead recommendation to avoid reversible side-to-side motion."
                 ),
                 "criteria": criteria,
             }
@@ -216,44 +264,33 @@ class LayaPolicy:
         inference_started = time.perf_counter()
         output = self.agent.predict(state, questions)
         inference_ms = (time.perf_counter() - inference_started) * 1000
-
         try:
-            answer = output["answers"]["placement"]
+            answer = output["answers"]["action"]
             raw_probabilities = answer["probabilities"]
-            probabilities = {
-                candidate.label: float(raw_probabilities[candidate.label])
-                for candidate in candidates
-            }
+            probabilities = {action: float(raw_probabilities[action]) for action in ACTIONS}
         except (KeyError, TypeError, ValueError) as error:
-            raise DecisionError("Laya returned an incomplete placement distribution") from error
+            raise DecisionError("Laya returned an incomplete action distribution") from error
         if any(not math.isfinite(value) or not 0 <= value <= 1 for value in probabilities.values()):
             raise DecisionError("Laya returned a non-finite or out-of-range probability")
         if not math.isclose(sum(probabilities.values()), 1.0, abs_tol=0.005):
-            raise DecisionError("Laya placement probabilities do not sum to one")
+            raise DecisionError("Laya action probabilities do not sum to one")
 
         proposed = str(answer.get("choice", ""))
-        valid = {candidate.label for candidate in candidates if not candidate.placement.top_out}
-        if proposed not in valid:
-            if not self.guarded:
-                raise DecisionError(f"Laya proposed an unsafe placement: {proposed!r}")
-            executed = (
-                max(valid, key=probabilities.__getitem__)
-                if valid
-                else max(probabilities, key=probabilities.__getitem__)
-            )
-        else:
-            executed = proposed
-        if self.guarded and proposed in valid and max_height >= 12:
-            by_label = {candidate.label: candidate.placement for candidate in candidates}
-            planner_best = max(candidates, key=lambda candidate: _quality(candidate.placement))
-            chosen = by_label[proposed]
-            best = planner_best.placement
-            if (
-                chosen.holes > best.holes
-                or chosen.max_height > best.max_height
-                or _quality(best) - _quality(chosen) > 0.5
+        by_label = {c.label: c for c in candidates}
+        if proposed not in by_label and not self.guarded:
+            raise DecisionError(f"Laya proposed an unknown action: {proposed!r}")
+        executed = proposed
+        if self.guarded:
+            chosen = by_label.get(proposed)
+            if chosen is None or chosen not in (fresh or usable):
+                executed = best.label
+            elif chosen.outcome.top_out and not best.outcome.top_out:
+                executed = best.label
+            elif best.outcome.max_height >= 12 and (
+                chosen.outcome.holes > best.outcome.holes
+                or _quality(best.outcome) - _quality(chosen.outcome) > 0.5
             ):
-                executed = planner_best.label
+                executed = best.label
         usage = output.get("usage", {})
         return PolicyDecision(
             candidates=candidates,

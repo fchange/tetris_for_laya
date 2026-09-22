@@ -10,13 +10,12 @@ import termios
 import time
 import tty
 from contextlib import nullcontext
-from dataclasses import replace
 from pathlib import Path
 
 from rich.console import Console
 from rich.live import Live
 
-from .game import TETROMINOES, Piece, TetrisGame
+from .game import TetrisGame
 from .policy import DEFAULT_MODEL, DecisionError, LayaPolicy, PolicyDecision
 from .ui import CandidateView, DecisionView, render_game
 
@@ -47,37 +46,18 @@ class Keyboard:
             termios.tcsetattr(self.fd, termios.TCSADRAIN, self.saved)
 
 
-def _decision_view(decision: PolicyDecision) -> DecisionView:
-    labels = {
-        candidate.label: (
-            f"{candidate.label} r{candidate.placement.landing.rotation} "
-            f"c{candidate.placement.landing.x}"
-        )
-        for candidate in decision.candidates
-    }
+def _decision_view(decision: PolicyDecision, step: int = 0) -> DecisionView:
     return DecisionView(
         candidates=tuple(
-            CandidateView(labels[candidate.label], decision.probabilities[candidate.label])
+            CandidateView(candidate.label, decision.probabilities[candidate.label])
             for candidate in decision.candidates
         ),
-        proposed=labels.get(decision.proposed, decision.proposed),
-        executed=labels.get(decision.executed, decision.executed),
+        proposed=decision.proposed,
+        executed=decision.executed,
         shield_applied=decision.intervened,
         inference_ms=decision.inference_ms if decision.model_called else None,
+        step=step,
     )
-
-
-def _animation_frames(game: TetrisGame, decision: PolicyDecision):
-    snapshot = game.snapshot()
-    landing = decision.placement.landing
-    shape = TETROMINOES[snapshot.current.kind][landing.rotation]
-    start_y = -max(y for _, y in shape) - 1
-    for y in range(start_y, landing.y + 1):
-        yield replace(
-            snapshot,
-            current=Piece(snapshot.current.kind, landing.rotation, landing.x, y),
-            ghost_y=landing.y,
-        )
 
 
 def _summary(
@@ -87,13 +67,16 @@ def _summary(
     interventions: int = 0,
 ) -> dict[str, object]:
     snapshot = game.snapshot()
+    elapsed = time.perf_counter() - started
     return {
         "score": snapshot.score,
         "lines": snapshot.lines,
         "level": snapshot.level,
         "pieces": snapshot.pieces,
+        "steps": game.steps,
         "game_over": snapshot.game_over,
-        "seconds": round(time.perf_counter() - started, 3),
+        "seconds": round(elapsed, 3),
+        "steps_per_second": round(game.steps / elapsed, 3) if elapsed else 0.0,
         "decisions": len(inference),
         "shield_interventions": interventions,
         "mean_inference_ms": round(sum(inference) / len(inference), 3) if inference else None,
@@ -114,6 +97,7 @@ def _run_laya(args: argparse.Namespace, console: Console) -> int:
     interventions = 0
     live = (
         Live(
+            render_game(game.snapshot(), DecisionView()),
             console=console,
             screen=not args.no_alt_screen,
             auto_refresh=False,
@@ -122,22 +106,24 @@ def _run_laya(args: argparse.Namespace, console: Console) -> int:
         if not args.headless
         else None
     )
-    quit_requested = False
     try:
         with Keyboard() if live else nullcontext() as keys, live if live else nullcontext():
-            while not game.game_over and not quit_requested:
+            while not game.game_over:
                 if args.pieces is not None and game.pieces >= args.pieces:
                     break
+                if live:
+                    pressed = keys.read().lower()
+                    if "q" in pressed or "\x03" in pressed:
+                        break
                 if live and (console.width < MIN_COLUMNS or console.height < MIN_ROWS):
                     live.update(
                         f"Resize terminal to at least {MIN_COLUMNS} columns × {MIN_ROWS} rows. "
                         "Q quits.",
                         refresh=True,
                     )
-                    if "q" in keys.read().lower():
-                        break
                     time.sleep(0.1)
                     continue
+                step_started = time.perf_counter()
                 try:
                     decision = policy.decide(game)
                 except DecisionError as error:
@@ -146,20 +132,12 @@ def _run_laya(args: argparse.Namespace, console: Console) -> int:
                 if decision.model_called:
                     inference.append(decision.inference_ms)
                 interventions += decision.intervened
-                view = _decision_view(decision)
+                game.step(decision.executed)
                 if live:
-                    for frame in _animation_frames(game, decision):
-                        pressed = keys.read().lower()
-                        if "q" in pressed or "\x03" in pressed:
-                            quit_requested = True
-                            break
-                        live.update(render_game(frame, view), refresh=True)
-                        time.sleep(1 / args.fps)
-                if quit_requested:
-                    break
-                game.apply_placement(decision.placement)
-                if live:
+                    view = _decision_view(decision, game.steps)
                     live.update(render_game(game.snapshot(), view), refresh=True)
+                if args.fps is not None:
+                    time.sleep(max(0, 1 / args.fps - (time.perf_counter() - step_started)))
     except KeyboardInterrupt:
         pass
     print(json.dumps(_summary(game, started, inference, interventions), indent=2))
@@ -224,7 +202,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--seed", type=int, default=7)
     parser.add_argument("--level", type=int, choices=range(10), default=0)
     parser.add_argument("--pieces", type=int, help="Stop after this many locked pieces")
-    parser.add_argument("--fps", type=float, default=30, help="Laya drop animation FPS")
+    parser.add_argument(
+        "--fps", type=float, help="Optional Laya action rate cap; default runs at model speed"
+    )
     parser.add_argument(
         "--optimize", action="store_true", help="Enable MLX compile and prompt cache"
     )
@@ -238,7 +218,7 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     if args.pieces is not None and args.pieces < 1:
         parser.error("--pieces must be positive")
-    if not 1 <= args.fps <= 240:
+    if args.fps is not None and not 1 <= args.fps <= 240:
         parser.error("--fps must be between 1 and 240")
     console = Console(highlight=False)
     if args.player == "human":

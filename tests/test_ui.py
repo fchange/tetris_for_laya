@@ -79,13 +79,17 @@ def test_game_screen_contains_stats_next_help_and_decision_telemetry() -> None:
 
     decision = DecisionView(
         candidates=(
-            CandidateView("T-r0-x3-y18", 0.625),
-            CandidateView("T-r1-x7-y17", 0.375),
+            CandidateView("LEFT", 0.625),
+            CandidateView("RIGHT", 0.375),
+            CandidateView("ROTATE", 0),
+            CandidateView("DOWN", 0),
+            CandidateView("WAIT", 0),
         ),
-        proposed="T-r0-x3-y18",
-        executed="T-r1-x7-y17",
+        proposed="LEFT",
+        executed="RIGHT",
         shield_applied=True,
         inference_ms=18.25,
+        step=42,
     )
     decision_output = _render(render_game(_snapshot(), decision))
 
@@ -93,14 +97,22 @@ def test_game_screen_contains_stats_next_help_and_decision_telemetry() -> None:
         text in decision_output
         for text in (
             "LAYA",
+            "ACTIONS",
+            "ROTATE",
+            "DOWN",
+            "WAIT",
             "62.5%",
             "37.5%",
             "PROPOSED",
             "EXECUTED",
             "APPLIED",
             "18.2 ms",
+            "STEP",
+            "42",
         )
     )
+    assert len(decision_output.splitlines()) == SCREEN_HEIGHT
+    assert "+1 more" not in decision_output
 
 
 def test_game_over_is_visible_in_stats_and_board() -> None:

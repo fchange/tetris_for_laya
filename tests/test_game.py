@@ -2,7 +2,16 @@ from dataclasses import FrozenInstanceError
 
 import pytest
 
-from tetris_for_laya.game import BOARD_HEIGHT, BOARD_WIDTH, Landing, TetrisGame
+from tetris_for_laya.game import (
+    ACTIONS,
+    BOARD_HEIGHT,
+    BOARD_WIDTH,
+    GRAVITY_STEPS,
+    Landing,
+    Piece,
+    TetrisGame,
+    piece_cells,
+)
 
 
 def test_snapshot_is_immutable_and_seeded_bag_is_reproducible() -> None:
@@ -161,3 +170,216 @@ def test_top_out_ends_the_game_and_disables_further_actions() -> None:
     assert game.placement_options() == ()
     assert not game.move_left()
     assert game.hard_drop() == 0
+
+
+@pytest.mark.parametrize("action,dx,dy", [("LEFT", -1, 0), ("RIGHT", 1, 0), ("DOWN", 0, 1)])
+def test_step_moves_only_one_cell(action: str, dx: int, dy: int) -> None:
+    game = TetrisGame(seed=_seed_for("O"))
+    before = game.current
+
+    result = game.step(action)
+
+    assert game.current == Piece(before.kind, before.rotation, before.x + dx, before.y + dy)
+    assert result.piece == game.current
+    assert result.moved and not result.locked
+    assert game.steps == 1
+    assert game.gravity_phase == 1
+    assert game.score == (1 if action == "DOWN" else 0)
+
+
+def test_step_rotation_uses_the_same_kicks_and_collisions_as_manual_rotation() -> None:
+    stepped = TetrisGame(seed=_seed_for("I"))
+    manual = TetrisGame(seed=_seed_for("I"))
+    stepped.current = manual.current = Piece("I", 1, 7, 4)
+
+    assert stepped.step("ROTATE").moved
+    assert manual.rotate()
+    assert stepped.current == manual.current == Piece("I", 2, 6, 4)
+
+    for game in (stepped, manual):
+        game.current = Piece("T", 0, 3, 5)
+        game._board = [["J"] * BOARD_WIDTH for _ in range(BOARD_HEIGHT)]
+        for x, y in piece_cells(game.current):
+            game._board[y][x] = None
+
+    before = stepped.current
+    assert not stepped.step("ROTATE").moved
+    assert not manual.rotate()
+    assert stepped.current == manual.current == before
+
+
+def test_preview_is_pure_and_matches_step() -> None:
+    game = TetrisGame(seed=7)
+    before = (game.snapshot(), game._random.getstate(), game._bag.copy(), game.steps)
+
+    for action in ACTIONS:
+        preview = game.preview_step(action)
+        assert (game.snapshot(), game._random.getstate(), game._bag, game.steps) == before
+        assert game.gravity_phase == 0
+        with pytest.raises(FrozenInstanceError):
+            preview.moved = False  # type: ignore[misc]
+
+    preview = game.preview_step("LEFT")
+    assert game.step("LEFT") == preview
+    assert game.current == preview.piece
+    assert game.gravity_phase == preview.gravity_phase
+
+
+def test_preview_can_simulate_a_piece_and_phase_without_changing_the_game() -> None:
+    game = TetrisGame(seed=_seed_for("O"))
+    before = game.snapshot()
+    simulated = Piece("O", 0, 2, 8)
+
+    preview = game.preview_step("RIGHT", piece=simulated, gravity_phase=GRAVITY_STEPS - 1)
+
+    assert preview.piece == Piece("O", 0, 3, 9)
+    assert preview.gravity_phase == 0
+    assert game.snapshot() == before
+    assert game.gravity_phase == 0
+
+
+def test_blocked_inputs_still_advance_gravity_once_every_four_steps() -> None:
+    game = TetrisGame(seed=_seed_for("O"))
+    while game.move_left():
+        pass
+    before = game.current
+
+    for _ in range(GRAVITY_STEPS - 1):
+        assert not game.step("LEFT").moved
+        assert game.current == before
+    result = game.step("LEFT")
+
+    assert not result.moved
+    assert game.current == Piece("O", 0, before.x, before.y + 1)
+    assert game.gravity_phase == 0
+    assert game.steps == GRAVITY_STEPS
+    assert game.score == 0
+
+
+def test_down_on_a_gravity_step_moves_only_one_row() -> None:
+    game = TetrisGame(seed=_seed_for("O"))
+    game.gravity_phase = GRAVITY_STEPS - 1
+    before = game.current
+
+    game.step("DOWN")
+
+    assert game.current.y == before.y + 1
+    assert game.gravity_phase == 0
+    assert game.score == 1
+
+
+@pytest.mark.parametrize("action", ["DOWN", "LEFT", "WAIT"])
+def test_lock_does_not_move_the_new_piece(action: str) -> None:
+    game = TetrisGame(seed=_seed_for("O"))
+    game.current = Piece("O", 0, 3, 18)
+    game.gravity_phase = GRAVITY_STEPS - 1
+    next_kind = game.next_kind
+    before = (game.snapshot(), game._random.getstate(), game._bag.copy())
+    preview = game.preview_step(action)
+    assert (game.snapshot(), game._random.getstate(), game._bag) == before
+    assert game.gravity_phase == GRAVITY_STEPS - 1
+
+    result = game.step(action)
+
+    assert result == preview
+    assert result.locked
+    assert result.piece.kind == "O"
+    assert result.piece.y == 18
+    assert game.current == Piece(next_kind, 0, 3, -1)
+    assert game.pieces == 1
+    assert game.gravity_phase == 0
+    assert game.score == 0
+    assert game.steps == 1
+
+
+def test_wait_consumes_steps_and_only_moves_on_the_gravity_tick() -> None:
+    game = TetrisGame(seed=_seed_for("O"))
+    before = game.current
+
+    for phase in range(1, GRAVITY_STEPS):
+        preview = game.preview_step("WAIT")
+        assert game.current == before
+        assert game.gravity_phase == phase - 1
+        result = game.step("WAIT")
+        assert result == preview
+        assert not result.moved and not result.locked
+        assert game.current == before
+        assert game.gravity_phase == phase
+
+    preview = game.preview_step("WAIT")
+    assert game.current == before
+    assert game.gravity_phase == GRAVITY_STEPS - 1
+    result = game.step("WAIT")
+
+    assert result == preview
+    assert not result.moved and not result.locked
+    assert game.current == Piece(before.kind, before.rotation, before.x, before.y + 1)
+    assert game.gravity_phase == 0
+    assert game.steps == GRAVITY_STEPS
+    assert game.score == 0
+
+
+def test_wait_at_rest_locks_only_on_the_gravity_tick() -> None:
+    game = TetrisGame(seed=_seed_for("O"))
+    game.current = Piece("O", 0, 3, 18)
+    resting = game.current
+    next_kind = game.next_kind
+
+    for _ in range(GRAVITY_STEPS - 1):
+        result = game.step("WAIT")
+        assert not result.moved and not result.locked
+        assert game.current == resting
+        assert game.pieces == 0
+
+    result = game.step("WAIT")
+
+    assert not result.moved and result.locked
+    assert result.piece == resting
+    assert game.current == Piece(next_kind, 0, 3, -1)
+    assert game.pieces == 1
+    assert game.gravity_phase == 0
+    assert game.score == 0
+
+
+def test_invalid_actions_raise_without_mutation_and_game_over_is_a_noop() -> None:
+    game = TetrisGame(seed=7)
+    before = game.snapshot()
+
+    for method in (game.preview_step, game.step):
+        with pytest.raises(ValueError, match="action"):
+            method("HARD_DROP")
+    assert game.snapshot() == before
+    assert game.steps == 0
+
+    game.game_over = True
+    before = game.snapshot()
+    for action in ACTIONS:
+        result = game.step(action)
+        assert not result.moved and not result.locked
+        assert game.snapshot() == before
+    assert game.steps == 0
+
+
+def test_evaluate_landing_is_pure_and_matches_placement_metrics() -> None:
+    game = TetrisGame(seed=7)
+    before = game.snapshot()
+
+    for option in game.placement_options():
+        assert game.evaluate_landing(option.landing) == option
+    assert game.snapshot() == before
+
+    with pytest.raises(ValueError, match="landing"):
+        game.evaluate_landing(Landing(0, 99, 99))
+
+
+def test_evaluate_landing_accepts_a_resting_position_below_an_overhang() -> None:
+    game = TetrisGame(seed=_seed_for("O"))
+    game._board[17][0] = game._board[17][1] = "I"
+    tucked = Landing(0, -1, 18)
+
+    assert tucked not in game.legal_landings()
+    option = game.evaluate_landing(tucked)
+
+    assert option.landing == tucked
+    assert not option.top_out
+    assert option.holes == 0

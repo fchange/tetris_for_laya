@@ -55,6 +55,7 @@ class DecisionView:
     executed: str | None = None
     shield_applied: bool = False
     inference_ms: float | None = None
+    step: int = 0
 
 
 def _solid_cell(kind: str) -> Text:
@@ -196,7 +197,7 @@ def _decision_panel(decision: DecisionView | None) -> Panel:
         )
 
     details = Text()
-    details.append("CANDIDATES\n", style="dim white")
+    details.append("ACTIONS\n", style="dim white")
     visible_candidates = decision.candidates[:5]
     for candidate in visible_candidates:
         marker = "▸" if candidate.label == decision.proposed else " "
@@ -220,6 +221,8 @@ def _decision_panel(decision: DecisionView | None) -> Panel:
     details.append("\nINFERENCE ", style="dim white")
     inference = "—" if decision.inference_ms is None else f"{decision.inference_ms:.1f} ms"
     details.append(inference, style="white")
+    details.append("\nSTEP      ", style="dim white")
+    details.append(str(decision.step), style="white")
 
     return Panel(
         details,

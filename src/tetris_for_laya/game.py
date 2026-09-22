@@ -10,6 +10,8 @@ BOARD_WIDTH = 10
 BOARD_HEIGHT = 20
 WIDTH = BOARD_WIDTH
 HEIGHT = BOARD_HEIGHT
+ACTIONS = ("LEFT", "RIGHT", "ROTATE", "DOWN", "WAIT")
+GRAVITY_STEPS = 4
 
 Cell: TypeAlias = str | None
 Board: TypeAlias = tuple[tuple[Cell, ...], ...]
@@ -74,6 +76,14 @@ class Piece:
 
 
 @dataclass(frozen=True, slots=True)
+class StepTransition:
+    piece: Piece
+    gravity_phase: int
+    moved: bool
+    locked: bool
+
+
+@dataclass(frozen=True, slots=True)
 class Landing:
     rotation: int
     x: int
@@ -129,6 +139,8 @@ class TetrisGame:
         self.level = start_level
         self.game_over = False
         self.pieces = 0
+        self.steps = 0
+        self.gravity_phase = 0
         self.current = Piece(self._take_kind(), 0, 3, -1)
         self.next_kind = self._take_kind()
 
@@ -173,23 +185,82 @@ class TetrisGame:
     def move_right(self) -> bool:
         return self._move(dx=1)
 
+    def _rotated(self, piece: Piece) -> Piece | None:
+        rotation = (piece.rotation + 1) % 4
+        for dx, dy in _KICKS:
+            candidate = Piece(piece.kind, rotation, piece.x + dx, piece.y + dy)
+            if self._valid(candidate):
+                return candidate
+        return None
+
     def rotate(self) -> bool:
         """Rotate clockwise, trying a small deterministic set of wall kicks."""
 
-        if self.game_over:
+        candidate = None if self.game_over else self._rotated(self.current)
+        if candidate is None:
             return False
-        rotation = (self.current.rotation + 1) % 4
-        for dx, dy in _KICKS:
+        self.current = candidate
+        return True
+
+    def preview_step(
+        self,
+        action: str,
+        *,
+        piece: Piece | None = None,
+        gravity_phase: int | None = None,
+    ) -> StepTransition:
+        """Simulate one input and its gravity tick without changing game state.
+
+        ``moved`` reports whether the movement input succeeded, independently of
+        gravity; WAIT always reports False and only advances the gravity clock.
+        A locked transition retains the old piece at its final board position.
+        """
+
+        if action not in ACTIONS:
+            raise ValueError(f"unknown action: {action}")
+        current = self.current if piece is None else piece
+        phase = self.gravity_phase if gravity_phase is None else gravity_phase
+        if self.game_over:
+            return StepTransition(current, phase, False, False)
+
+        if action == "WAIT":
+            candidate = None
+        elif action == "ROTATE":
+            candidate = self._rotated(current)
+        else:
+            dx = -1 if action == "LEFT" else 1 if action == "RIGHT" else 0
             candidate = Piece(
-                self.current.kind,
-                rotation,
-                self.current.x + dx,
-                self.current.y + dy,
+                current.kind, current.rotation, current.x + dx, current.y + (action == "DOWN")
             )
-            if self._valid(candidate):
-                self.current = candidate
-                return True
-        return False
+            if not self._valid(candidate):
+                candidate = None
+        moved = candidate is not None
+        current = candidate if moved else current
+        locked = action == "DOWN" and not moved
+        phase = (phase + 1) % GRAVITY_STEPS
+
+        if phase == 0 and action != "DOWN":
+            below = Piece(current.kind, current.rotation, current.x, current.y + 1)
+            if self._valid(below):
+                current = below
+            else:
+                locked = True
+        return StepTransition(current, 0 if locked else phase, moved, locked)
+
+    def step(self, action: str) -> StepTransition:
+        """Execute one keyboard action; blocked inputs still consume a timestep."""
+
+        transition = self.preview_step(action)
+        if self.game_over:
+            return transition
+        self.steps += 1
+        self.current = transition.piece
+        self.gravity_phase = transition.gravity_phase
+        if action == "DOWN" and transition.moved:
+            self.score += 1
+        if transition.locked:
+            self._lock_current()
+        return transition
 
     def _ghost_y(self, piece: Piece | None = None) -> int:
         candidate = piece or self.current
@@ -227,6 +298,7 @@ class TetrisGame:
         return distance
 
     def _lock_current(self) -> int:
+        self.gravity_phase = 0
         top_out = False
         for x, y in piece_cells(self.current):
             if y < 0:
@@ -326,24 +398,28 @@ class TetrisGame:
         bumpiness = sum(abs(left - right) for left, right in zip(heights, heights[1:]))
         return holes, max_height, aggregate_height, bumpiness
 
+    def evaluate_landing(self, landing: Landing) -> PlacementOption:
+        """Evaluate a resting piece for planning, without executing the placement."""
+
+        piece = Piece(self.current.kind, landing.rotation, landing.x, landing.y)
+        below = Piece(piece.kind, piece.rotation, piece.x, piece.y + 1)
+        if self.game_over or not self._valid(piece) or self._valid(below):
+            raise ValueError("landing must be a valid resting position")
+        board, cleared, top_out = self._simulate_landing(landing)
+        holes, max_height, aggregate_height, bumpiness = self._board_metrics(board)
+        return PlacementOption(
+            id=f"{self.current.kind}-r{landing.rotation}-x{landing.x}-y{landing.y}",
+            landing=landing,
+            lines=cleared,
+            holes=holes,
+            max_height=max_height,
+            aggregate_height=aggregate_height,
+            bumpiness=bumpiness,
+            top_out=top_out,
+        )
+
     def placement_options(self) -> tuple[PlacementOption, ...]:
-        options: list[PlacementOption] = []
-        for landing in self.legal_landings():
-            board, cleared, top_out = self._simulate_landing(landing)
-            holes, max_height, aggregate_height, bumpiness = self._board_metrics(board)
-            options.append(
-                PlacementOption(
-                    id=(f"{self.current.kind}-r{landing.rotation}-x{landing.x}-y{landing.y}"),
-                    landing=landing,
-                    lines=cleared,
-                    holes=holes,
-                    max_height=max_height,
-                    aggregate_height=aggregate_height,
-                    bumpiness=bumpiness,
-                    top_out=top_out,
-                )
-            )
-        return tuple(options)
+        return tuple(self.evaluate_landing(landing) for landing in self.legal_landings())
 
     def apply_placement(self, placement: PlacementOption | Landing) -> int:
         """Validate and apply an agent-selected landing as one atomic action."""
