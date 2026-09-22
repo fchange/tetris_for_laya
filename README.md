@@ -5,14 +5,16 @@ action at a time on Apple Silicon.
 
 ![Laya playing Tetris in the Rich terminal UI](docs/assets/demo.gif)
 
-The demo records consecutive real game states from the multilingual MLX checkpoint, seed 7.
+The GIF above is an archived demo of the earlier planner-assisted policy, not the current
+independent-decision version. It records consecutive real game states from the multilingual
+MLX checkpoint, seed 7.
 Every frame follows one fresh Laya decision and one executed input. The GIF is replayed at the
 measured average tick rate of the recorded run, without interpolated movement or a preselected
 landing animation.
 
 The game engine is implemented independently. Its restrained three-column terminal presentation
 is inspired by [`samtay/tetris`](https://github.com/samtay/tetris), and its model integration follows
-the explicit planner → typed decision → safety shield pattern demonstrated by
+the typed decision interface demonstrated by
 [`mizorewww/laya-mlx`](https://github.com/mizorewww/laya-mlx).
 
 ## Highlights
@@ -21,7 +23,7 @@ the explicit planner → typed decision → safety shield pattern demonstrated b
 - Local FP16 inference through `laya-mlx`; no cloud API and no downloads during play
 - A fresh model decision for every LEFT, RIGHT, ROTATE, DOWN or WAIT action
 - Visible action probabilities, proposed/executed keys, step count and inference latency
-- An explicit safety shield whose interventions are labeled and counted
+- An input legality guard whose replacements are labeled and counted
 - Human keyboard mode using the same engine and Rich interface
 
 ## Requirements
@@ -118,29 +120,48 @@ including blocked inputs. `DOWN` on that fourth input counts as the gravity row,
 twice. A newly spawned piece is not moved by the previous piece's locking input. An explicit `--fps`
 adds a rate cap for slow observation without changing physics. Headless mode uses the same tick loop.
 
-A planner supplies **lookahead guidance** for each key: the best reachable future board and the
-number of further inputs needed. It explores the engine's real movement, collision, rotation and
-gravity rules, scoring line clears, holes, aggregate height and bumpiness. The graph is cached while
-the board stays fixed and queried from the actual state every step. These are future estimates, not
-the immediate result of a key, and no planned path is automatically executed.
+The model observes all 20 board rows (`#` fixed, `.` empty), the current piece's position,
+rotation and occupied cells, the next piece's spawn shape, the gravity clock and basic rules.
+The last eight confirmed inputs for the current piece include before/after poses; history clears
+on spawn. Action descriptions contain only their meaning and immediate input legality.
 
-Laya still makes every action proposal. A visible safety shield can replace an unknown/blocked key,
-a repeated state, or a key whose reachable futures all top out when a safer key exists. At high stack
-heights it can also reject materially worse outcomes. The TUI retains the original probabilities and
-shows the proposed and executed keys; every override is labeled `SHIELD APPLIED` and counted.
+The policy does not search landings, calculate future board scores, recommend actions or reject
+poor strategic decisions. Legal reversals, waiting and moves that lose the game are left to Laya.
+If a proposal is unknown or blocked, the input guard selects the model's highest-probability legal
+key, including WAIT. DOWN is legal while resting because it locks the piece. Original probabilities
+remain visible; any replacement is labeled `SHIELD APPLIED` and counted.
 
-In a local seed-7 smoke run, **50 pieces required 1,841 model calls and 1,841 engine steps**, clearing
-8 lines without topping out, with 256 explicit shield interventions. Mean model inference was
-27.17 ms, excluding planner/rendering time (about 36 headless ticks per second overall). This assisted
-single-step result is not comparable to
-the original release's one-decision-per-piece scores, and inference latency varies by hardware.
+The short instruction is adapted from the Laya request in
+[`trungdq88/jev-tetris`](https://github.com/trungdq88/jev-tetris/blob/HEAD/public/players.js):
+“Pick the best keyboard action: clear lines, avoid holes, keep the stack low and flat.”
+Only “placement” is changed to “keyboard action”; our candidates remain single-step controls.
+
+Laya truncates each option to 48 tokens and shares a small prefix budget between instructions
+and options. A checkpoint-tokenizer regression verifies that the complete instruction, options,
+board and eight-step history survive encoding, including a densely occupied board. It is skipped
+when the local tokenizer is unavailable. Earlier planner-assisted results do not describe this
+independent-decision policy.
+
+## Current result and limitations
+
+The independent policy currently plays poorly. In a local seed-7 run with the multilingual MLX
+checkpoint, it topped out after **16 pieces and 657 inputs, clearing 0 lines**. The model proposed
+RIGHT 561 times and LEFT 96 times. The legality guard replaced 266 blocked inputs using the
+model's own highest-probability legal alternative; it did not optimize placements. Executed inputs
+were RIGHT 351, LEFT 305 and DOWN 1.
+
+This is one observed run, not a multi-seed benchmark. Providing the board and keeping the prompt
+within the token budget did not produce effective placement planning. The repository is a working
+local decision-model experiment, not a claim of strong autonomous Tetris play. The diagnostic run
+limited the MLX allocator cache to 64 MiB after an earlier process was terminated; that cache limit
+is not enabled by default in the gameplay CLI.
 
 ## Architecture
 
 ```text
 src/tetris_for_laya/
 ├── game.py    deterministic single-step rules, pure previews, snapshots and board metrics
-├── policy.py  per-action Laya prompt, reachable-state lookahead and visible safety shield
+├── policy.py  board observation, per-action Laya prompt and input legality guard
 ├── ui.py      pure Rich renderables; no model or game-loop side effects
 └── cli.py     observe → decide → step → render loop and headless runner
 ```

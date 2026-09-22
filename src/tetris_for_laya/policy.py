@@ -1,29 +1,25 @@
-"""One Laya keyboard decision per step, with explicit lookahead and safety checks."""
+"""One Laya keyboard decision per step, from board observations, with input legality checks."""
 
 from __future__ import annotations
 
-import heapq
 import math
 import os
 import time
-from collections import defaultdict, deque
+from collections import deque
 from dataclasses import dataclass
-from itertools import count
 from pathlib import Path
 from typing import Any, Protocol
 
 from .game import (
     ACTIONS,
     GRAVITY_STEPS,
-    Landing,
     Piece,
-    PlacementOption,
     StepTransition,
     TetrisGame,
+    piece_cells,
 )
 
 DEFAULT_MODEL = Path("models/laya-multilingual-mlx")
-Node = tuple[Piece, int]
 
 
 class DecisionError(RuntimeError):
@@ -38,8 +34,7 @@ class AgentLike(Protocol):
 class Candidate:
     label: str
     transition: StepTransition
-    outcome: PlacementOption
-    remaining_steps: int
+    legal: bool
 
 
 @dataclass(frozen=True, slots=True)
@@ -53,91 +48,6 @@ class PolicyDecision:
     decision_ms: float
     input_tokens: int
     model_called: bool
-
-
-def _quality(option: PlacementOption) -> float:
-    return (
-        0.760666 * option.lines
-        - 0.510066 * option.aggregate_height
-        - 0.35663 * option.holes
-        - 0.184483 * option.bumpiness
-    )
-
-
-def _rank(option: PlacementOption, steps: int) -> tuple:
-    return (
-        int(option.top_out),
-        -_quality(option),
-        steps,
-        option.landing.rotation,
-        option.landing.x,
-        option.landing.y,
-    )
-
-
-class _Lookahead:
-    """Evaluate reachable futures with the same single-step physics as play.
-
-    The board stays fixed while a piece falls. Cache this graph until it locks;
-    each decision queries it from the actual current pose and gravity phase.
-    No path or final placement is sent to the execution loop.
-    """
-
-    def __init__(self, game: TetrisGame) -> None:
-        start = (game.current, game.gravity_phase)
-        self.transitions: dict[Node, dict[str, StepTransition]] = {}
-        self.values: dict[Node, tuple[tuple, PlacementOption]] = {}
-        self.terminals: dict[Landing, PlacementOption] = {}
-        reverse: dict[Node, list[Node]] = defaultdict(list)
-        queue = deque([start])
-        seen = {start}
-        heap = []
-        serial = count()
-        while queue:
-            node = queue.popleft()
-            edges = self.transitions[node] = {}
-            for action in ACTIONS:
-                transition = game.preview_step(action, piece=node[0], gravity_phase=node[1])
-                edges[action] = transition
-                if transition.locked:
-                    piece = transition.piece
-                    landing = Landing(piece.rotation, piece.x, piece.y)
-                    if landing not in self.terminals:
-                        self.terminals[landing] = game.evaluate_landing(landing)
-                    outcome = self.terminals[landing]
-                    heapq.heappush(heap, (_rank(outcome, 1), next(serial), node, outcome))
-                else:
-                    target = (transition.piece, transition.gravity_phase)
-                    reverse[target].append(node)
-                    if target not in seen:
-                        seen.add(target)
-                        queue.append(target)
-
-        # Reverse shortest paths: quality first, then fewer inputs.
-        # Distance breaks reversible LEFT/RIGHT ties without executing a path.
-        while heap:
-            rank, _, node, outcome = heapq.heappop(heap)
-            if node in self.values:
-                continue
-            self.values[node] = (rank, outcome)
-            for parent in reverse[node]:
-                if parent not in self.values:
-                    heapq.heappush(
-                        heap, (_rank(outcome, rank[2] + 1), next(serial), parent, outcome)
-                    )
-
-    def candidates(self, node: Node) -> tuple[Candidate, ...]:
-        candidates = []
-        for action, transition in self.transitions[node].items():
-            if transition.locked:
-                piece = transition.piece
-                outcome = self.terminals[Landing(piece.rotation, piece.x, piece.y)]
-                steps = 1
-            else:
-                rank, outcome = self.values[(transition.piece, transition.gravity_phase)]
-                steps = rank[2] + 1
-            candidates.append(Candidate(action, transition, outcome, steps))
-        return tuple(candidates)
 
 
 def resolve_checkpoint(value: str | Path = DEFAULT_MODEL) -> Path:
@@ -178,7 +88,8 @@ class LayaPolicy:
     ) -> None:
         self.guarded = guarded
         self._board_key: tuple | None = None
-        self._seen: set[Node] = set()
+        self._history: deque[tuple[str, Piece, StepTransition]] = deque(maxlen=8)
+        self._pending: tuple[int, str, Piece, StepTransition] | None = None
         if agent is not None:
             self.agent = agent
             self.model_path: Path | None = None
@@ -204,59 +115,69 @@ class LayaPolicy:
         snapshot = game.snapshot()
         node = (snapshot.current, game.gravity_phase)
         key = (snapshot.pieces, snapshot.board, snapshot.current.kind, snapshot.next_kind)
-        if key != self._board_key or node not in self._lookahead.transitions:
-            self._lookahead = _Lookahead(game)
+        if key != self._board_key:
             self._board_key = key
-            self._seen.clear()
-        self._seen.add(node)
-        candidates = self._lookahead.candidates(node)
-        usable = [
-            c for c in candidates if c.label == "WAIT" or c.transition.moved or c.transition.locked
-        ]
-        fresh = [
-            c
-            for c in usable
-            if c.transition.locked
-            or (c.transition.piece, c.transition.gravity_phase) not in self._seen
-        ]
-        best = min(fresh or usable, key=lambda c: _rank(c.outcome, c.remaining_steps))
+            self._history.clear()
+            self._pending = None
+        if self._pending is not None:
+            step, action, before, transition = self._pending
+            if game.steps == step + 1 and node == (transition.piece, transition.gravity_phase):
+                self._history.append((action, before, transition))
+            elif game.steps != step:
+                self._history.clear()
+            self._pending = None
+        # Only immediate input legality is inspected; no landing search or scoring.
+        candidates = tuple(
+            Candidate(action, transition, action in ("DOWN", "WAIT") or transition.moved)
+            for action in ACTIONS
+            for transition in (game.preview_step(action),)
+        )
         piece = snapshot.current
+        history = (
+            "; ".join(
+                f"{action}: ({before.x},{before.y},r{before.rotation}) -> "
+                f"({result.piece.x},{result.piece.y},r{result.piece.rotation})"
+                f"{' blocked' if action != 'WAIT' and not result.moved else ''}"
+                for action, before, result in self._history
+            )
+            or "none (new piece)"
+        )
+        board = "\n".join(
+            "".join("#" if cell is not None else "." for cell in row) for row in snapshot.board
+        )
         state = (
-            f"Tetris keyboard control. Current piece {piece.kind}: "
-            f"x={piece.x}, y={piece.y}, rotation={piece.rotation}. Next: {snapshot.next_kind}. "
-            f"Gravity in {GRAVITY_STEPS - game.gravity_phase} inputs. "
-            f"Lookahead recommends {best.label}. Execute only ONE action, then observe again. "
-            "Do not move merely to stay active; WAIT is a deliberate action."
+            "Tetris 10x20. Coordinates x=0..9 left to right, y=0..19 top to bottom; "
+            "negative y is above board. Board shows fixed cells only: # filled, . empty.\n"
+            f"Board rows top to bottom:\n{board}\n"
+            f"Current piece {piece.kind}: x={piece.x}, y={piece.y}, rotation={piece.rotation}. "
+            f"Current occupied cells: {piece_cells(piece)}. "
+            f"Next: {snapshot.next_kind}; spawn shape offsets: "
+            f"{piece_cells(Piece(snapshot.next_kind, 0, 0, 0))}. "
+            "Full rows clear; locking above the top loses. Each key consumes one tick; "
+            f"gravity falls one row every {GRAVITY_STEPS} ticks, next in "
+            f"{GRAVITY_STEPS - game.gravity_phase}. DOWN falls once, not twice on a gravity tick. "
+            "Resting pieces lock on a gravity tick or DOWN. Rotation uses wall kicks. "
+            f"Recent executed inputs (oldest first): {history}."
         )
         descriptions = {
-            "LEFT": "Move left ONE column",
-            "RIGHT": "Move right ONE column",
-            "ROTATE": "Rotate clockwise ONCE, using wall kicks if needed",
-            "DOWN": "Move down ONE row; lock only if already resting",
-            "WAIT": "Do not move or rotate; let the gravity clock advance",
+            "LEFT": "Move one column left.",
+            "RIGHT": "Move one column right.",
+            "ROTATE": "Rotate clockwise once, with wall kicks.",
+            "DOWN": "Move one row down; lock if resting.",
+            "WAIT": "No movement input; advance gravity clock.",
         }
-        criteria = {}
-        for candidate in candidates:
-            transition, outcome = candidate.transition, candidate.outcome
-            criteria[candidate.label] = (
-                f"{descriptions[candidate.label]}. "
-                f"{'Input blocked. ' if candidate not in usable else ''}"
-                f"{'Locks now. ' if transition.locked else ''}"
-                f"Best reachable future after this key: {outcome.holes} holes, "
-                f"{outcome.lines} lines cleared, height {outcome.max_height}, "
-                f"{candidate.remaining_steps} inputs to lock. "
-                f"{'TOP OUT. ' if outcome.top_out else ''}"
-                f"{'Recommended next key.' if candidate.label == best.label else ''}"
+        criteria = {
+            candidate.label: (
+                f"{'Legal' if candidate.legal else 'Input blocked'}. "
+                f"{descriptions[candidate.label]}"
             )
+            for candidate in candidates
+        }
         questions = {
             "action": {
                 "type": "choice",
                 "instructions": (
-                    "Choose the next single keyboard action. Avoid blocked keys and top-out, "
-                    "minimize future holes and clear lines. Use LEFT, RIGHT or ROTATE only when "
-                    "it improves the reachable board. Choose WAIT when the current column and "
-                    "rotation are already suitable and natural gravity can safely continue. "
-                    "Use the lookahead recommendation to avoid reversible side-to-side motion."
+                    "Pick the best keyboard action: clear lines, avoid holes, keep the stack low and flat."
                 ),
                 "criteria": criteria,
             }
@@ -282,15 +203,12 @@ class LayaPolicy:
         executed = proposed
         if self.guarded:
             chosen = by_label.get(proposed)
-            if chosen is None or chosen not in (fresh or usable):
-                executed = best.label
-            elif chosen.outcome.top_out and not best.outcome.top_out:
-                executed = best.label
-            elif best.outcome.max_height >= 12 and (
-                chosen.outcome.holes > best.outcome.holes
-                or _quality(best.outcome) - _quality(chosen.outcome) > 0.5
-            ):
-                executed = best.label
+            if chosen is None or not chosen.legal:
+                # Keep the model's own preference among legal inputs, including WAIT.
+                executed = max(
+                    (c.label for c in candidates if c.legal), key=probabilities.__getitem__
+                )
+        self._pending = (game.steps, executed, piece, by_label[executed].transition)
         usage = output.get("usage", {})
         return PolicyDecision(
             candidates=candidates,
